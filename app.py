@@ -1,238 +1,167 @@
 import streamlit as st
-import torch
 import numpy as np
 from PIL import Image
+import torch
 import cv2
-import os
-import tempfile
+from segment_anything import sam_model_registry, SamPredictor
 
-# Import our modules
-from models.unet_plusplus import UNetPlusPlus
-from models.sam_wrapper import SAMWrapper
-from utils.data_loader import preprocess_medical_image, preprocess_agricultural_image
-from utils.visualization import overlay_mask, visualize_results
+# ----------------------------
+# Configuration
+# ----------------------------
+CHECKPOINT_PATH = "sam_vit_b_01ec64.pth"
+MODEL_TYPE = "vit_b"
 
-# Set page config
+# Check device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ----------------------------
+# Helper Functions
+# ----------------------------
+@st.cache_resource
+def load_sam_model():
+    """Load SAM model once and cache it"""
+    sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH)
+    sam.to(device=DEVICE)
+    predictor = SamPredictor(sam)
+    return predictor
+
+
+def show_mask(mask, ax, random_color=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])  # Dodger blue
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+
+
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels == 1]
+    neg_points = coords[labels == 0]
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white',
+               linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white',
+               linewidth=1.25)
+
+
+def overlay_mask_on_image(image, mask, alpha=0.6):
+    """Overlay binary mask on image"""
+    image = np.array(image)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+    overlay = image.copy()
+    mask_binary = (mask > 0).astype(np.uint8) * 255
+
+    # Create colored mask (blue)
+    colored_mask = np.zeros_like(image)
+    colored_mask[:, :, 2] = mask_binary  # Blue channel
+
+    # Blend
+    cv2.addWeighted(colored_mask, alpha, overlay, 1 - alpha, 0, overlay)
+
+    return overlay
+
+
+# ----------------------------
+# Streamlit App
+# ----------------------------
 st.set_page_config(
-    page_title="Advanced Segmentation Tool",
-    page_icon="🔍",
+    page_title="SAM Universal Segmenter",
+    page_icon="✂️",
     layout="wide"
 )
 
-# Title and description
-st.title("🔍 Advanced Segmentation for Medical & Agricultural Applications")
+st.title("✂️ SAM Universal Image Segmenter")
 st.markdown("""
-This application demonstrates advanced segmentation techniques:
-- **U-Net++** for medical imaging (MRI tumor segmentation)
-- **SAM (Segment Anything Model)** for agricultural applications (leaf disease detection)
+Upload **any image**, click on **points** to indicate what to **keep (🟢)** or **exclude (🔴)**, then click **Segment**!
+- **Green star** = object you want to segment
+- **Red star** = background or things to ignore
 """)
 
-# Sidebar for application selection
-st.sidebar.header("Application Settings")
-app_mode = st.sidebar.selectbox(
-    "Choose Application",
-    ["Medical Imaging (MRI Tumor Segmentation)", "Agricultural Imaging (Leaf Disease Detection)"]
-)
+# Initialize session state
+if 'points' not in st.session_state:
+    st.session_state.points = []
+if 'labels' not in st.session_state:
+    st.session_state.labels = []
+if 'image' not in st.session_state:
+    st.session_state.image = None
+if 'segmentation_done' not in st.session_state:
+    st.session_state.segmentation_done = False
 
-# Device selection
-device = "cuda" if torch.cuda.is_available() else "cpu"
-st.sidebar.info(f"Using device: {device}")
+# Sidebar
+with st.sidebar:
+    st.header("How to Use")
+    st.markdown("""
+    1. Upload an image
+    2. Click **'Add Foreground Point'** and click on the image where the object is
+    3. (Optional) Click **'Add Background Point'** to exclude areas
+    4. Click **'Segment'**
+    5. Download the mask or overlay
+    """)
 
-# Medical Imaging Section
-if "Medical" in app_mode:
-    st.header("🧠 Medical Imaging: MRI Tumor Segmentation")
-
-
-    # Load pre-trained model
-    @st.cache_resource
-    def load_medical_model():
-        model = UNetPlusPlus(num_classes=1, input_channels=3)
-        # In a real application, you would load weights from a trained model
-        # For demo purposes, we'll use a randomly initialized model
-        model.eval()
-        return model.to(device)
-
-
-    model = load_medical_model()
-
-    # Upload medical image
-    uploaded_file = st.file_uploader("Upload an MRI scan", type=["png", "jpg", "jpeg", "bmp"])
+    uploaded_file = st.file_uploader("📤 Upload Image", type=["png", "jpg", "jpeg"])
 
     if uploaded_file is not None:
-        # Display original image
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded MRI Scan", use_column_width=True)
+        image = Image.open(uploaded_file).convert("RGB")
+        st.session_state.image = image
+        # Reset points when new image is uploaded
+        st.session_state.points = []
+        st.session_state.labels = []
+        st.session_state.segmentation_done = False
 
-        # Preprocess image
-        input_tensor = preprocess_medical_image(image)
-        input_tensor = input_tensor.to(device)
+# Main area
+col1, col2 = st.columns([2, 1])
 
-        # Run inference
-        with torch.no_grad():
-            prediction = model(input_tensor)
-            prediction = torch.sigmoid(prediction)
+with col2:
+    st.subheader("Controls")
 
-        # Convert to numpy for visualization
-        pred_mask = prediction.squeeze().cpu().numpy()
+    if st.session_state.image is not None:
+        if st.button("🟢 Add Foreground Point (Click on object)"):
+            st.session_state.point_type = 1
+        if st.button("🔴 Add Background Point (Click on background)"):
+            st.session_state.point_type = 0
 
-        # Create overlay
-        overlay = overlay_mask(image, pred_mask, alpha=0.6, color=(255, 0, 0))
+        if st.button("✂️ Segment!"):
+            if len(st.session_state.points) == 0:
+                st.warning("Please add at least one point!")
+            else:
+                try:
+                    predictor = load_sam_model()
+                    image_np = np.array(st.session_state.image)
+                    predictor.set_image(image_np)
 
-        # Display results
-        col1, col2, col3 = st.columns(3)
+                    input_points = np.array(st.session_state.points)
+                    input_labels = np.array(st.session_state.labels)
 
-        with col1:
-            st.image(image, caption="Original MRI", use_column_width=True)
+                    masks, scores, logits = predictor.predict(
+                        point_coords=input_points,
+                        point_labels=input_labels,
+                        multimask_output=True,
+                    )
 
-        with col2:
-            st.image(pred_mask, caption="Predicted Tumor Mask", use_column_width=True)
+                    # Pick best mask
+                    best_idx = np.argmax(scores)
+                    st.session_state.mask = masks[best_idx]
+                    st.session_state.overlay = overlay_mask_on_image(st.session_state.image, st.session_state.mask)
+                    st.session_state.segmentation_done = True
+                    st.success("✅ Segmentation complete!")
+                except Exception as e:
+                    st.error(f"Error during segmentation: {str(e)}")
 
-        with col3:
-            st.image(overlay, caption="Overlay", use_column_width=True)
+        if st.button("🔄 Reset Points"):
+            st.session_state.points = []
+            st.session_state.labels = []
+            st.session_state.segmentation_done = False
+            st.rerun()
 
-        # Download options
-        st.subheader("Download Results")
-        mask_pil = Image.fromarray((pred_mask * 255).astype(np.uint8))
-        overlay_pil = Image.fromarray(overlay)
+with col1:
+    if st.session_state.image is not None:
+        # Display image and handle clicks
+        image_width = 600
+        st_image = st.image(st.session_state.image, width=image_width, caption="Click on the image to add points")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="Download Mask",
-                data=mask_pil.tobytes(),
-                file_name="tumor_mask.png",
-                mime="image/png"
-            )
-        with col2:
-            st.download_button(
-                label="Download Overlay",
-                data=overlay_pil.tobytes(),
-                file_name="tumor_overlay.png",
-                mime="image/png"
-            )
-
-    else:
-        st.info("Please upload an MRI scan to perform tumor segmentation.")
-
-        # Show example
-        st.subheader("Example")
-        example_path = "data/medical/example_mri.jpg"
-        if os.path.exists(example_path):
-            example_img = Image.open(example_path)
-            st.image(example_img, caption="Example MRI Scan", use_column_width=True)
-
-# Agricultural Imaging Section
-else:
-    st.header("🌿 Agricultural Imaging: Leaf Disease Detection")
-
-
-    # Load SAM model
-    @st.cache_resource
-    def load_sam_model():
-        # Note: In a real deployment, you would need to download the SAM checkpoint
-        # For this demo, we'll simulate the functionality
-        try:
-            # This would normally load the actual model
-            # sam = SAMWrapper(checkpoint_path="sam_vit_h_4b8939.pth")
-            # return sam
-            return "SAM Model (simulated)"
-        except Exception as e:
-            st.warning(f"Could not load SAM model: {e}")
-            return None
-
-
-    sam_model = load_sam_model()
-
-    # Upload agricultural image
-    uploaded_file = st.file_uploader("Upload a leaf image", type=["png", "jpg", "jpeg", "bmp"])
-
-    if uploaded_file is not None:
-        # Display original image
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Leaf Image", use_column_width=True)
-
-        # Preprocess image
-        processed_image = preprocess_agricultural_image(image)
-
-        # Simulate SAM segmentation
-        # In a real implementation, you would use:
-        # sam_model.set_image(processed_image)
-        # mask, score = sam_model.predict(...)
-
-        # For demo purposes, we'll create a simulated mask
-        h, w = processed_image.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-
-        # Create a simulated diseased region (for demo)
-        center_x, center_y = w // 2, h // 2
-        radius = min(w, h) // 4
-        y, x = np.ogrid[:h, :w]
-        mask_area = (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2
-        mask[mask_area] = 1
-
-        # Create overlay
-        overlay = overlay_mask(processed_image, mask, alpha=0.6, color=(0, 0, 255))  # Blue for disease
-
-        # Display results
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.image(image, caption="Original Leaf", use_column_width=True)
-
-        with col2:
-            st.image(mask, caption="Disease Mask", use_column_width=True)
-
-        with col3:
-            st.image(overlay, caption="Disease Overlay", use_column_width=True)
-
-        # Disease analysis
-        disease_area = np.sum(mask) / mask.size * 100
-        st.subheader("Disease Analysis")
-        st.metric("Affected Area", f"{disease_area:.2f}%")
-
-        if disease_area > 10:
-            st.warning("⚠️ Significant disease detected! Consider treatment.")
-        elif disease_area > 2:
-            st.info("ℹ️ Minor disease detected. Monitor closely.")
-        else:
-            st.success("✅ Healthy leaf detected!")
-
-        # Download options
-        st.subheader("Download Results")
-        mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
-        overlay_pil = Image.fromarray(overlay)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="Download Disease Mask",
-                data=mask_pil.tobytes(),
-                file_name="disease_mask.png",
-                mime="image/png"
-            )
-        with col2:
-            st.download_button(
-                label="Download Overlay",
-                data=overlay_pil.tobytes(),
-                file_name="disease_overlay.png",
-                mime="image/png"
-            )
-
-    else:
-        st.info("Please upload a leaf image to detect diseases.")
-
-        # Show example
-        st.subheader("Example")
-        example_path = "data/agricultural/example_leaf.jpg"
-        if os.path.exists(example_path):
-            example_img = Image.open(example_path)
-            st.image(example_img, caption="Example Leaf Image", use_column_width=True)
-
-# Footer
-st.markdown("---")
-st.markdown("""
-**Note**: 
-- For medical applications, this demo uses a randomly initialized U-Net++ model. In practice, you would need to train the model on medical datasets.
-- For agricultural applications, SAM requires a checkpoint file which is not included due to size constraints. The demo simulates the functionality.
-- Always consult with medical professionals for actual diagnosis.
-""")
+        # Use st.canvas or coordinate input? → We'll use a workaround with number inputs
+        st.markdown("###
