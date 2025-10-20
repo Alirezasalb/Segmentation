@@ -6,7 +6,7 @@ import cv2
 
 
 class SAMWrapper:
-    def __init__(self, model_type="vit_h", checkpoint_path="sam_vit_h_4b8939.pth"):
+    def __init__(self, model_type="vit_h", checkpoint_path="sam_vit_b_01ec64.pth"):
         """
         Initialize SAM model
         Note: You need to download the checkpoint from https://github.com/facebookresearch/segment-anything#model-checkpoints
