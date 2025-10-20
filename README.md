@@ -13,7 +13,7 @@ A **universal image segmentation tool** powered by Meta's **Segment Anything Mod
 
 ##  Quick Start
 
-### Option 1: Local Setup (Recommended for first run)
+### Local Setup 
 
 1. **Clone the repo**
    ```bash
