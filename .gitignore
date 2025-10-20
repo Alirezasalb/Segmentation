@@ -1,0 +1,4 @@
+sam_vit_b_01ec64.pth
+__pycache__/
+*.pyc
+.env
